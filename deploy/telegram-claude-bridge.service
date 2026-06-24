@@ -1,0 +1,18 @@
+[Unit]
+Description=Telegram <-> Claude Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/services/telegram-claude-bridge
+EnvironmentFile=/home/ubuntu/services/api-keys/keys.env
+ExecStart=/home/ubuntu/services/telegram-claude-bridge/.venv/bin/python -m bridge
+Restart=always
+RestartSec=5
+# 민감정보가 코어덤프로 새지 않도록
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

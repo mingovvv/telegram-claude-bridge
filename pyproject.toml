@@ -1,0 +1,16 @@
+[project]
+name = "telegram-claude-bridge"
+version = "0.1.0"
+description = "텔레그램 ↔ Claude Agent SDK 브릿지 데몬 (호스트 원격 조종)"
+requires-python = ">=3.10"
+dependencies = [
+    "claude-agent-sdk>=0.2.108",
+    "python-telegram-bot>=22,<23",
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["bridge"]

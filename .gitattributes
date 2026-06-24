@@ -1,0 +1,9 @@
+# 이 저장소는 리눅스 호스트(systemd, ubuntu)에 배포된다.
+# Windows에서 작업하더라도 줄바꿈은 항상 LF로 고정한다.
+# (CRLF로 변환되면 .service 파싱/셸 스크립트가 깨질 수 있음)
+* text=auto eol=lf
+
+# 바이너리로 취급 (줄바꿈 변환 금지)
+*.png binary
+*.jpg binary
+*.ico binary
