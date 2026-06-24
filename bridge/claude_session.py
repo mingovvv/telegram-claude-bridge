@@ -9,6 +9,7 @@ SDK 의 다양한 메시지/이벤트를 텔레그램 어댑터가 다루기 쉬
 from __future__ import annotations
 
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from typing import AsyncIterator
 
@@ -18,6 +19,7 @@ from claude_agent_sdk import (
     ClaudeSDKClient,
     ClaudeSDKError,
     PermissionResultAllow,
+    PermissionResultDeny,
     ResultMessage,
     StreamEvent,
     TextBlock,
@@ -60,28 +62,77 @@ class Done:
 BridgeEvent = TextDelta | ToolStart | Notice | Done
 
 
+# CLI 에러 메시지/표준에러에서 "인증 문제"를 식별하는 키워드.
+# (재연결으로 해결 안 되므로 → 운영자에게 재로그인을 안내해야 한다)
+AUTH_HINTS = (
+    "login", "log in", "/login", "claude login",
+    "unauthorized", "authentication", "not authenticated",
+    "credential", "oauth", "token expired", "session expired", "expired",
+    "invalid api key", "api key", "401", "403", "forbidden",
+)
+
+
 class ClaudeSession:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self._client: ClaudeSDKClient | None = None
+        # 최근 CLI stderr 라인(진단용). 턴마다 비우고 채운다.
+        self._stderr: deque[str] = deque(maxlen=80)
+        # 권한 게이트 훅: async (tool_name, tool_input) -> bool (True=허용).
+        # app 이 주입한다. 미설정이면 전부 허용(완전 자동).
+        self._gate = None
+
+    def set_permission_gate(self, fn) -> None:
+        """도구 실행 전 호출되는 게이트. True 반환 시 허용, False 시 거부."""
+        self._gate = fn
+
+    # --- 진단 ---
+    def _on_stderr(self, line: str) -> None:
+        line = (line or "").rstrip()
+        if line:
+            self._stderr.append(line)
+
+    def _is_auth_error(self, exc: Exception) -> bool:
+        blob = (str(exc) + "\n" + "\n".join(self._stderr)).lower()
+        return any(h in blob for h in AUTH_HINTS)
+
+    def _diagnose(self, exc: Exception) -> str:
+        """에러 + 캡처된 stderr를 사람이 읽을 메시지로 변환."""
+        tail = " / ".join(list(self._stderr)[-3:]).strip()
+        if self._is_auth_error(exc):
+            return (
+                "⚠️ Claude 로그인/인증 문제로 보입니다. 서버에서 `claude login` 으로 "
+                "재로그인이 필요할 수 있어요.\n"
+                f"원인: {tail or exc}"
+            )
+        return f"세션 오류: {exc}" + (f"\n(stderr: {tail})" if tail else "")
 
     # --- 라이프사이클 ---
-    @staticmethod
-    async def _allow_all_tools(tool_name, tool_input, context):
-        """모든 도구 호출을 무조건 승인 = 완전 자동.
+    async def _permission_callback(self, tool_name, tool_input, context):
+        """도구 실행 전 호출. 게이트가 있으면 물어보고, 없으면 전부 허용.
 
         root 에서는 --dangerously-skip-permissions(=bypassPermissions)가 거부되므로,
-        기본 권한 모드 + 이 콜백으로 'ask' 를 전부 allow 처리해 동일한 완전 자동 효과를 낸다.
+        기본 권한 모드 + 이 콜백으로 'ask' 를 처리해 완전 자동(+선택적 확인)을 구현한다.
+        게이트는 위험 명령에만 텔레그램 버튼 확인을 띄운다(나머지는 즉시 허용).
         """
+        if self._gate is not None:
+            try:
+                allowed = await self._gate(tool_name, tool_input or {})
+            except Exception:  # noqa: BLE001 — 게이트 실패 시 안전하게 거부
+                log.exception("권한 게이트 오류 → 거부")
+                return PermissionResultDeny(message="권한 확인 중 오류가 발생해 거부했어요.")
+            if not allowed:
+                return PermissionResultDeny(message="사용자가 실행을 취소했어요.")
         return PermissionResultAllow()
 
     def _build_options(self) -> ClaudeAgentOptions:
         kwargs: dict = dict(
-            # root 에서 bypassPermissions 사용 불가 → 자동승인 콜백으로 완전 자동 구현
-            can_use_tool=self._allow_all_tools,
+            # root 에서 bypassPermissions 사용 불가 → 콜백으로 완전 자동(+위험명령 확인) 구현
+            can_use_tool=self._permission_callback,
             cwd=self.cfg.cwd,
             system_prompt=self.cfg.system_prompt,
             include_partial_messages=True,  # 텍스트 델타 스트리밍 수신
+            stderr=self._on_stderr,  # CLI stderr 캡처(인증 만료 등 원인 진단용)
         )
         if self.cfg.model:
             kwargs["model"] = self.cfg.model
@@ -119,22 +170,28 @@ class ClaudeSession:
     async def ask(self, prompt: str) -> AsyncIterator[BridgeEvent]:
         """사용자 메시지를 세션에 투입하고 정규화된 이벤트를 스트리밍한다.
 
-        세션이 끊겨 있으면 한 번 재연결을 시도하고, 그래도 실패하면 Notice 를 내보낸다.
+        인증 문제면 재연결해도 소용없으므로 즉시 안내한다.
+        그 외 일시적 오류면 1회 재연결을 시도하고, 그래도 실패하면 진단 메시지를 낸다.
         """
-        if self._client is None:
-            await self.connect()
-
+        self._stderr.clear()  # 이번 턴의 stderr만 모은다
         try:
+            if self._client is None:
+                await self.connect()
             async for ev in self._run(prompt):
                 yield ev
         except (ClaudeSDKError, ConnectionError, BrokenPipeError) as exc:
-            log.warning("세션 오류, 재연결 시도: %s", exc)
+            log.warning("세션 오류: %s", exc)
+            # 인증 에러는 재연결해도 동일하게 실패 → 바로 재로그인 안내
+            if self._is_auth_error(exc):
+                yield Notice(self._diagnose(exc))
+                return
+            # 일시적 오류 → 1회 재연결 시도
             try:
                 await self.reset()
                 yield Notice("세션이 끊겨 재연결했어요. 메시지를 다시 보내 주세요.")
             except Exception as exc2:  # noqa: BLE001
                 log.error("재연결 실패: %s", exc2)
-                yield Notice(f"세션 재연결 실패: {exc2}")
+                yield Notice(self._diagnose(exc2))
 
     async def _run(self, prompt: str) -> AsyncIterator[BridgeEvent]:
         assert self._client is not None

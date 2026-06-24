@@ -42,9 +42,12 @@ SSH로 들어와서 하던 작업을 그대로 텔레그램 채팅으로 옮긴�
 bridge/
   __main__.py         엔트리포인트(python -m bridge): 설정 로드 + run_polling
   config.py           환경변수 로더 + 검증
-  claude_session.py   Agent SDK 영속 세션 → 정규화된 이벤트 스트림
-  telegram_stream.py  스트리밍 어댑터(throttle · 4096 분할 · MarkdownV2 fallback · typing)
-  app.py              배선: 화이트리스트 · 큐 워커 · 핸들러
+  claude_session.py   Agent SDK 영속 세션 → 정규화된 이벤트 스트림 + 권한 게이트
+  telegram_stream.py  스트리밍 어댑터(throttle · 4096 분할 · HTML 렌더 · typing)
+  render.py           CommonMark → 텔레그램 HTML 변환(표·코드·리스트, 한글폭 보정)
+  danger.py           파괴적 도구 호출 감지(rm·kubectl delete·systemctl stop …)
+  interactive.py      인라인 키보드: 버튼 띄우고 탭을 await 로 수신
+  app.py              배선: 화이트리스트 · 큐 워커 · 핸들러 · 위험명령 게이트 · /menu
 deploy/
   telegram-claude-bridge.service   systemd 유닛
 ```
@@ -53,11 +56,17 @@ deploy/
 - 단일 영속 세션을 기동 시 1회 `connect`, 살려둔 채 메시지마다 `query`.
 - 들어온 메시지는 `asyncio.Queue` → **단일 워커가 순차 처리**(영속 세션은 동시 1요청만 안전).
 - 텍스트는 델타로 스트리밍(≈1.2초 throttle), 도구 호출은 `$ Bash: …` 상태 라인으로 중계.
-- 4096자를 넘으면 메시지를 확정하고 새 메시지로 이어감. 완료 시 마지막 메시지만 MarkdownV2.
+- 완료 시 마크다운을 **텔레그램 HTML**로 렌더(파싱 실패 시 plain 폴백). 4096자 초과는 새 메시지로 이어감.
+- **표 렌더**: 순수 ASCII면 모노스페이스 그리드, 한글 등 wide 문자가 섞이면 줄별 레코드 레이아웃(폰트 무관).
+
+인터랙티브
+- **위험명령 확인**: 읽기/조회는 자동 실행, `rm`·`kubectl delete`·`systemctl stop` 등 **파괴적 명령만** `[✅ 실행] [❌ 취소]` 버튼으로 확인(`can_use_tool` 게이트). 무응답 시 자동 취소.
+- **`/menu`**: 노드/파드/디스크/ArgoCD/로그/대화초기화 빠른 실행 버튼.
 
 명령어
 | 명령 | 동작 |
 |------|------|
+| `/menu` | 빠른 작업 버튼 |
 | `/status` | 세션 · 큐 · 모델 · 가동시간 |
 | `/reset` | 대화 맥락 초기화(새 세션) |
 | `/help`, `/start` | 도움말 |

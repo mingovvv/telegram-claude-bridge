@@ -19,7 +19,7 @@ from telegram import Bot
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest, RetryAfter, TelegramError
 
-from .markdown import to_markdown_v2
+from .render import to_telegram_html
 
 log = logging.getLogger(__name__)
 
@@ -66,28 +66,11 @@ class TelegramStreamer:
         self._last_edit = now
 
     async def finalize(self) -> None:
-        """턴 종료: 남은 내용을 모두 반영하고 마지막 메시지를 MarkdownV2 로 마무리."""
+        """턴 종료: 남은 내용을 모두 반영하고 마지막 메시지를 HTML 로 마무리."""
         if not self._full.strip():
             self._full = EMPTY_RESULT
         await self._ensure_message()
-        # 1) 남은 plain 내용 확정 (오버플로 분할 포함)
         await self._render_pages(final=True)
-        # 2) 마지막 메시지만 MarkdownV2 시도, 실패 시 plain 유지
-        page = self._full[self._committed :] or EMPTY_RESULT
-        md = to_markdown_v2(page)
-        if md == page:
-            return  # escape 할 게 없으면 그대로 둔다
-        try:
-            await self.bot.edit_message_text(
-                md,
-                chat_id=self.chat_id,
-                message_id=self._msg_id,
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
-        except BadRequest as exc:
-            if "not modified" in str(exc).lower():
-                return
-            log.debug("MarkdownV2 최종 렌더 실패, plain 유지: %s", exc)
 
     # --- 내부 ---
     async def _ensure_message(self) -> None:
@@ -106,7 +89,7 @@ class TelegramStreamer:
             if split < MAX_LEN // 2:  # 마땅한 줄바꿈이 없으면 강제 분할
                 split = MAX_LEN
             head = page[:split]
-            await self._edit(self._msg_id, head)
+            await self._edit_html(self._msg_id, head)  # 넘쳐서 확정되는 페이지 → HTML 마무리
             self._committed += len(head)
             self._last_rendered = ""
             # 새 메시지로 이어감
@@ -115,8 +98,10 @@ class TelegramStreamer:
             page = self._full[self._committed :]
 
         text = page or PLACEHOLDER
-        if text != self._last_rendered:
-            await self._edit(self._msg_id, text)
+        if final:
+            await self._edit_html(self._msg_id, text)  # 완료 → HTML 렌더
+        elif text != self._last_rendered:
+            await self._edit(self._msg_id, text)  # 스트리밍 중엔 plain
             self._last_rendered = text
 
     async def _send(self, text: str):
@@ -148,6 +133,25 @@ class TelegramStreamer:
             if "not modified" in str(exc).lower():
                 return
             log.debug("edit BadRequest: %s", exc)
+
+    async def _edit_html(self, msg_id: int | None, md_text: str) -> None:
+        """페이지를 HTML로 렌더해 확정. 파싱 실패 시 plain 으로 폴백(절대 안 깨짐)."""
+        if msg_id is None:
+            return
+        rendered = to_telegram_html(md_text)
+        try:
+            await self.bot.edit_message_text(
+                rendered, chat_id=self.chat_id, message_id=msg_id,
+                parse_mode=ParseMode.HTML,
+            )
+        except RetryAfter as exc:
+            await asyncio.sleep(exc.retry_after + 0.5)
+            await self._edit_html(msg_id, md_text)
+        except BadRequest as exc:
+            if "not modified" in str(exc).lower():
+                return
+            log.debug("HTML 렌더 실패, plain 폴백: %s", exc)
+            await self._edit(msg_id, md_text)  # 원본 마크다운을 plain 으로
 
 
 async def typing_loop(bot: Bot, chat_id: int, interval: float = 4.0) -> None:

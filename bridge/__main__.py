@@ -42,7 +42,11 @@ def main() -> int:
 
     app = build_application(cfg)
     # run_polling 이 이벤트 루프/시그널 처리/그레이스풀 종료를 모두 담당한다.
-    app.run_polling(allowed_updates=["message"], drop_pending_updates=True)
+    # callback_query 를 반드시 포함해야 인라인 버튼 탭이 봇에 도달한다.
+    app.run_polling(
+        allowed_updates=["message", "callback_query"],
+        drop_pending_updates=True,
+    )
     return 0
 
 

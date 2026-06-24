@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import time
 
@@ -16,14 +17,17 @@ from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
 
+from . import danger
 from .claude_session import ClaudeSession, Done, Notice, TextDelta, ToolStart
 from .config import Config
+from .interactive import CB_MENU, CB_PROMPT, ButtonPrompt
 from .telegram_stream import TelegramStreamer, typing_loop
 
 log = logging.getLogger(__name__)
@@ -33,13 +37,25 @@ JOB_MSG = "msg"
 JOB_RESET = "reset"
 
 HELP_TEXT = (
-    "*Telegram <-> Claude Bridge*\n\n"
+    "<b>Telegram ↔ Claude Bridge</b>\n\n"
     "메시지를 보내면 호스트에서 Claude 가 직접 작업을 수행하고 결과를 스트리밍합니다.\n\n"
     "명령어:\n"
+    "/menu — 빠른 작업 메뉴\n"
     "/status — 세션/큐 상태\n"
     "/reset — 대화 맥락 초기화 (새 세션)\n"
     "/help — 도움말"
 )
+
+# /menu 버튼 → 실제로 Claude 에 보낼 프롬프트
+MENU_ITEMS: list[tuple[str, str, str]] = [
+    # (key, 버튼라벨, Claude에 보낼 프롬프트)
+    ("nodes", "🖥 노드 상태", "kubectl get nodes 로 모든 노드 상태를 확인하고 표로 요약해줘."),
+    ("pods", "📦 파드 상태", "전체 네임스페이스 파드를 확인하고 Running 아닌 것 위주로 요약해줘."),
+    ("disk", "💾 디스크", "각 노드의 디스크 사용량(df -h /)을 확인해서 요약해줘."),
+    ("argocd", "🔄 ArgoCD", "ArgoCD 애플리케이션들의 sync/health 상태를 확인해줘."),
+    ("logs", "📜 최근 에러", "최근 문제가 있어 보이는 파드의 로그를 살펴보고 이상 징후를 알려줘."),
+    ("reset", "🧹 대화 초기화", ""),  # prompt 빈값 = 특수 동작(아래에서 별도 처리)
+]
 
 
 class Bridge:
@@ -50,6 +66,29 @@ class Bridge:
         self._worker: asyncio.Task | None = None
         self._busy = False
         self._started_at = time.time()
+        self._buttons: ButtonPrompt | None = None
+        self._current_chat_id: int | None = None  # 게이트가 어느 채팅에 물어볼지
+
+    # --- 위험 명령 게이트 (can_use_tool 콜백이 호출) ---
+    async def _permission_gate(self, tool_name: str, tool_input: dict) -> bool:
+        reason = danger.assess(tool_name, tool_input)
+        if reason is None:
+            return True  # 안전 → 즉시 허용
+        chat_id = self._current_chat_id
+        if chat_id is None or self._buttons is None:
+            return True  # 물어볼 채널이 없으면 기존처럼 자동 허용
+        preview = str(tool_input.get("command") or tool_input.get("file_path") or "")
+        if len(preview) > 300:
+            preview = preview[:299] + "…"
+        text = (
+            f"⚠️ <b>위험 작업 확인</b>\n"
+            f"유형: {html.escape(reason)}\n"
+            f"<pre>{html.escape(preview)}</pre>\n실행할까요?"
+        )
+        idx = await self._buttons.ask(
+            chat_id, text, ["✅ 실행", "❌ 취소"], timeout=180.0, timeout_index=1
+        )
+        return idx == 0
 
     # --- 보안: 화이트리스트 (모든 핸들러 첫 줄) ---
     def _allowed(self, update: Update) -> bool:
@@ -63,7 +102,15 @@ class Bridge:
 
     # --- 라이프사이클 (PTB post_init/post_shutdown 훅) ---
     async def post_init(self, application: Application) -> None:
-        await self.session.connect()
+        # 초기 연결이 실패해도(예: claude 로그인 만료) 데몬을 죽이지 않는다.
+        # 죽으면 systemd 크래시 루프가 되어 텔레그램으로 아무 신호도 못 준다.
+        # 대신 가동을 유지하고, 첫 메시지 때 재연결을 시도하며 원인을 안내한다.
+        self._buttons = ButtonPrompt(application.bot)
+        self.session.set_permission_gate(self._permission_gate)
+        try:
+            await self.session.connect()
+        except Exception as exc:  # noqa: BLE001
+            log.error("초기 Claude 세션 연결 실패 — 데몬은 계속 가동: %s", exc)
         self._worker = asyncio.create_task(self._run_worker(application))
         log.info("브릿지 시작됨. 허용 chat_id: %s", sorted(self.cfg.allowed_ids))
 
@@ -90,7 +137,7 @@ class Bridge:
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._allowed(update):
             return
-        await self._reply(context, update.effective_chat.id, HELP_TEXT, markdown=True)
+        await self._reply(context, update.effective_chat.id, HELP_TEXT, html=True)
 
     async def cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._allowed(update):
@@ -147,6 +194,7 @@ class Bridge:
     async def _process_message(self, bot, chat_id: int, text: str) -> None:
         streamer = TelegramStreamer(bot, chat_id)
         typing = asyncio.create_task(typing_loop(bot, chat_id))
+        self._current_chat_id = chat_id  # 위험명령 게이트가 이 채팅에 확인 버튼을 띄운다
         try:
             async for ev in self.session.ask(text):
                 if isinstance(ev, TextDelta):
@@ -162,6 +210,7 @@ class Bridge:
                     if ev.is_error:
                         streamer.add_text("\n\n(오류로 종료됨)")
         finally:
+            self._current_chat_id = None
             typing.cancel()
             try:
                 await typing
@@ -169,17 +218,63 @@ class Bridge:
                 pass
             await streamer.finalize()
 
-    # --- 헬퍼 ---
-    async def _reply(self, context, chat_id: int, text: str, markdown: bool = False) -> None:
-        await self._safe_send(context.bot, chat_id, text, markdown=markdown)
+    # --- /menu + 콜백 ---
+    async def cmd_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._allowed(update):
+            return
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(label, callback_data=f"{CB_MENU}:{key}")]
+             for key, label, _ in MENU_ITEMS]
+        )
+        await context.bot.send_message(
+            update.effective_chat.id, "⚡ <b>빠른 작업</b> — 항목을 선택하세요.",
+            reply_markup=keyboard, parse_mode=ParseMode.HTML,
+        )
 
-    async def _safe_send(self, bot, chat_id: int, text: str, markdown: bool = False) -> None:
+    async def on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        if update.effective_user is None or update.effective_user.id not in self.cfg.allowed_ids:
+            if query:
+                await query.answer()  # 미허용자: 조용히 무시
+            return
+        await query.answer()
+        data = query.data or ""
+        if data.startswith(f"{CB_PROMPT}:"):
+            # 위험명령 확인 버튼 → 대기 중인 게이트를 깨운다
+            _, token, idx = data.split(":", 2)
+            if self._buttons:
+                self._buttons.resolve(token, int(idx))
+        elif data.startswith(f"{CB_MENU}:"):
+            key = data.split(":", 1)[1]
+            chat_id = query.message.chat.id
+            if key == "reset":
+                # 되돌릴 수 없는 동작 → 확인 버튼 한 번 더
+                if self._buttons is None:
+                    return
+                idx = await self._buttons.ask(
+                    chat_id,
+                    "🧹 <b>대화 맥락을 초기화</b>할까요?\n지금까지의 대화 내용이 사라지고 새 세션으로 시작합니다.",
+                    ["✅ 초기화", "❌ 취소"], timeout=60.0, timeout_index=1,
+                )
+                if idx == 0:
+                    await self._enqueue(context, JOB_RESET, chat_id, None)
+                return
+            prompt = next((p for k, _, p in MENU_ITEMS if k == key), None)
+            if prompt:
+                await self._enqueue(context, JOB_MSG, chat_id, prompt)
+
+    # --- 헬퍼 ---
+    async def _reply(self, context, chat_id: int, text: str, html: bool = False) -> None:
+        await self._safe_send(context.bot, chat_id, text, html=html)
+
+    async def _safe_send(self, bot, chat_id: int, text: str, html: bool = False) -> None:
         try:
             await bot.send_message(
-                chat_id, text, parse_mode=ParseMode.MARKDOWN if markdown else None
+                chat_id, text, parse_mode=ParseMode.HTML if html else None
             )
         except TelegramError:
-            # markdown 파싱 실패 등 → plain 으로 한 번 더 시도
+            # HTML 파싱 실패 등 → plain 으로 한 번 더 시도
             try:
                 await bot.send_message(chat_id, text)
             except TelegramError:
@@ -197,7 +292,9 @@ def build_application(cfg: Config) -> Application:
     )
     app.add_handler(CommandHandler("start", bridge.cmd_help))
     app.add_handler(CommandHandler("help", bridge.cmd_help))
+    app.add_handler(CommandHandler("menu", bridge.cmd_menu))
     app.add_handler(CommandHandler("reset", bridge.cmd_reset))
     app.add_handler(CommandHandler("status", bridge.cmd_status))
+    app.add_handler(CallbackQueryHandler(bridge.on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bridge.on_message))
     return app
