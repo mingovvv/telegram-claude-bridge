@@ -28,7 +28,7 @@ from . import danger
 from .claude_session import ClaudeSession, Done, Notice, TextDelta, ToolStart
 from .config import Config
 from .interactive import CB_MENU, CB_PROMPT, ButtonPrompt
-from .telegram_stream import TelegramStreamer, typing_loop
+from .telegram_stream import TelegramStreamer, typing_loop, _summarize_tool_input
 
 log = logging.getLogger(__name__)
 
@@ -77,9 +77,7 @@ class Bridge:
         chat_id = self._current_chat_id
         if chat_id is None or self._buttons is None:
             return True  # 물어볼 채널이 없으면 기존처럼 자동 허용
-        preview = str(tool_input.get("command") or tool_input.get("file_path") or "")
-        if len(preview) > 300:
-            preview = preview[:299] + "…"
+        preview = _summarize_tool_input(tool_input, limit=300) or tool_name
         text = (
             f"⚠️ <b>위험 작업 확인</b>\n"
             f"유형: {html.escape(reason)}\n"
@@ -150,16 +148,18 @@ class Bridge:
         uptime = int(time.time() - self._started_at)
         h, rem = divmod(uptime, 3600)
         m, s = divmod(rem, 60)
+        session_state = "🟢 연결됨" if self.session.connected else "🔴 끊김"
+        busy_state = "🔄 처리 중" if self._busy else "💤 대기"
         status = (
-            "상태\n"
-            f"• 세션: {'연결됨' if self.session.connected else '끊김'}\n"
-            f"• 처리 중: {'예' if self._busy else '아니오'}\n"
-            f"• 대기 큐: {self.queue.qsize()}건\n"
-            f"• 모델: {self.cfg.model or '기본값'}\n"
-            f"• 작업 디렉토리: {self.cfg.cwd}\n"
+            "📊 <b>브릿지 상태</b>\n\n"
+            f"• 세션: {session_state}\n"
+            f"• 작업: {busy_state}\n"
+            f"• 대기 큐: <b>{self.queue.qsize()}</b>건\n"
+            f"• 모델: <code>{html.escape(self.cfg.model or '기본값')}</code>\n"
+            f"• 작업 경로: <code>{html.escape(self.cfg.cwd)}</code>\n"
             f"• 가동 시간: {h}시간 {m}분 {s}초"
         )
-        await self._reply(context, update.effective_chat.id, status)
+        await self._reply(context, update.effective_chat.id, status, html=True)
 
     # --- 큐 / 워커 ---
     async def _enqueue(self, context, kind: str, chat_id: int, payload: str | None) -> None:
@@ -186,7 +186,8 @@ class Bridge:
                 raise
             except Exception as exc:  # noqa: BLE001 — 워커는 절대 죽지 않는다
                 log.exception("작업 처리 실패")
-                await self._safe_send(bot, chat_id, f"오류가 발생했어요: {exc}")
+                err = f"❗ <b>오류가 발생했어요</b>\n<pre>{html.escape(str(exc))}</pre>"
+                await self._safe_send(bot, chat_id, err, html=True)
             finally:
                 self._busy = False
                 self.queue.task_done()
@@ -204,11 +205,11 @@ class Bridge:
                     streamer.add_tool(ev.name, ev.tool_input)
                     await streamer.flush(force=True)
                 elif isinstance(ev, Notice):
-                    streamer.add_text("\n" + ev.text + "\n")
+                    streamer.add_notice(ev.text)
                     await streamer.flush(force=True)
                 elif isinstance(ev, Done):
                     if ev.is_error:
-                        streamer.add_text("\n\n(오류로 종료됨)")
+                        streamer.add_notice("⚠️ 오류로 종료됨")
         finally:
             self._current_chat_id = None
             typing.cancel()

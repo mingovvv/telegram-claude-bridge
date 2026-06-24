@@ -49,10 +49,14 @@ class TelegramStreamer:
 
     def add_tool(self, name: str, tool_input: dict) -> None:
         summary = _summarize_tool_input(tool_input)
-        line = f"\n\n$ {name}"
+        line = f"\n\n_⚙️ {name}_"
         if summary:
-            line += f": {summary}"
+            line += f"\n```\n{summary}\n```"
         self._full += line + "\n"
+
+    def add_notice(self, text: str) -> None:
+        """시스템성 안내(상태/경고 등) — 답변 본문과 구분되게 이탤릭으로."""
+        self._full += f"\n_{text.strip()}_\n"
 
     # --- 출력 ---
     async def flush(self, force: bool = False) -> None:
@@ -68,7 +72,7 @@ class TelegramStreamer:
     async def finalize(self) -> None:
         """턴 종료: 남은 내용을 모두 반영하고 마지막 메시지를 HTML 로 마무리."""
         if not self._full.strip():
-            self._full = EMPTY_RESULT
+            self._full = f"_{EMPTY_RESULT}_"
         await self._ensure_message()
         await self._render_pages(final=True)
 
