@@ -7,7 +7,7 @@ systemd `EnvironmentFile`(keys.env)로 주입된 환경변수를 읽어 검증�
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 # --- 환경변수 키 이름 (SPEC §6) ---
@@ -22,7 +22,7 @@ DEFAULT_CWD = "/home/ubuntu"
 DEFAULT_SYSTEM_PROMPT = (
     "너는 k3-instance 호스트에서 텔레그램을 통해 운영자와 대화하는 운영 비서다. "
     "Bash/kubectl/파일 편집 등 호스트의 모든 도구를 직접 실행할 수 있다 "
-    "(ubuntu 사용자 권한, 모든 권한 자동 승인). "
+    "(root 권한, 모든 권한 자동 승인). "
     "운영자는 SSH 대신 텔레그램으로 너에게 작업을 지시한다. "
     "답변은 간결하게, 실행한 명령과 핵심 결과 위주로. "
     "긴 출력은 요약하되 중요한 에러/경고는 빠뜨리지 마라. "

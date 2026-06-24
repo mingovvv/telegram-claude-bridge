@@ -5,9 +5,16 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ubuntu
+# root로 실행 — /root/.claude 구독 인증과 nvm node v20(claude CLI 동작)을 상속해야 함.
+# (ubuntu 유저는 node v10이라 claude CLI가 파싱에러로 죽고, root 소유 keys.env도 못 읽음)
+User=root
 WorkingDirectory=/home/ubuntu/services/telegram-claude-bridge
 EnvironmentFile=/home/ubuntu/services/api-keys/keys.env
+# claude CLI가 ~/.claude 자격증명을 찾도록 HOME 고정
+Environment=HOME=/root
+# nvm node v20을 PATH 맨 앞에 — Agent SDK가 띄우는 claude CLI가 node v20으로 실행되게.
+# 이 줄이 빠지면 시스템 node v10을 잡아 CLI가 파싱에러로 즉사한다.
+Environment=PATH=/root/.nvm/versions/node/v20.20.1/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/home/ubuntu/services/telegram-claude-bridge/.venv/bin/python -m bridge
 Restart=always
 RestartSec=5
